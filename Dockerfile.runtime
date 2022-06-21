@@ -1,0 +1,28 @@
+ARG PHP_VERSION=8.1
+FROM php:${PHP_VERSION}-apache
+ARG TRUSTED_PROXY_IP=127.0.0.2
+ARG TIMEZONE=UTC
+
+ENV DEBIAN_FRONTEND noninteractive
+
+RUN apt-get update \
+    && apt -y upgrade \
+    && apt-get install -y libgmp-dev libpng-dev libgd-dev libxml2-dev libbz2-dev gnupg apt-transport-https \
+    && docker-php-ext-install pdo gmp gd gettext sockets soap bz2 mysqli pdo_mysql \
+    && docker-php-ext-enable gd \
+    && docker-php-ext-enable sockets \
+    && docker-php-ext-enable gettext \
+    && docker-php-ext-enable soap \
+    && docker-php-ext-enable mysqli \
+    && docker-php-ext-enable pdo_mysql \
+    && a2enmod remoteip && a2enmod headers && a2enmod rewrite && a2enmod remoteip && a2enmod setenvif \
+    && apt-get clean
+
+RUN sed -i -e 's#DocumentRoot /var/www/html#DocumentRoot\ /var/www/html/public#' /etc/apache2/sites-enabled/000-default.conf \
+  && sed -i -e 's#^ServerTokens.*#ServerTokens ProductOnly#' /etc/apache2/conf-available/security.conf \
+  && echo "RemoteIPHeader X-Forwarded-For" >> /etc/apache2/conf-enabled/container.conf \
+  && echo "RemoteIPTrustedProxy ${TRUSTED_PROXY_IP}" >> /etc/apache2/conf-enabled/container.conf \
+  && echo "SetEnvIf X-Forwarded-Proto https HTTPS=on" >> /etc/apache2/conf-enabled/container.conf \
+  && cp /usr/local/etc/php/php.ini-development /usr/local/etc/php/php.ini \
+  && sed -i -e 's#^expose_php.*#expose_php = Off#' /usr/local/etc/php/php.ini \
+  && echo "date.timezone = ${TIMEZONE}' >> /usr/local/etc/php/php.ini
