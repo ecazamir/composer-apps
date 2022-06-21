@@ -1,0 +1,156 @@
+variables:
+  SONAR_SCANNER_CLI_VERSION: 4
+  SONAR_PROJECT_KEY: "ExampleProject"
+  ENV_URL_DEV: "https://sonar.server.example.com/project_key/"
+  FORCE_CONTAINER_REBUILD: "false"
+  # Set FORCE_DB_UPDATE to true when you want to trigger 
+  FORCE_DB_UPGRADE: ""
+  FORCE_DB_SEED: ""
+
+stages:
+  - Quality Check
+  - Build container images
+  - Build runtime
+  - Dev stage
+  - Prod stage
+
+sonar_scan:
+  stage: Quality Check
+  tags:
+    - dev
+    - k8s
+  image: sonarsource/sonar-scanner-cli:${SONAR_SCANNER_CLI_VERSION}
+  variables:
+    SONAR_PROJECT_BASE_DIR: $CI_PROJECT_DIR
+    SONAR_PROJECT_KEY: $SONAR_PROJECT_KEY
+    SONAR_LOGIN: $SONAR_LOGIN
+    SONAR_HOST_URL: $SONAR_HOST_URL
+  script:
+    - /usr/bin/entrypoint.sh sonar-scanner -Dsonar.projectKey="$SONAR_PROJECT_KEY"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH != "main"
+      when: never
+
+build_docker_image_builder:
+  stage: Build container images
+  tags:
+    - dev
+    - k8s
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - NOW=`date +%Y%m%d`
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile.builder"
+      --destination "${CI_REGISTRY_IMAGE}:builder"
+      --destination "${CI_REGISTRY_IMAGE}:builder-${CI_COMMIT_SHORT_SHA}"
+  rules:
+    - changes:
+        - Dockerfile.builder
+    - if: $FORCE_CONTAINER_REBUILD != "false"
+      when: on_success
+
+build_docker_image_php_runtime:
+  stage: Build container images
+  tags:
+    - dev
+    - k8s
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - NOW=`date +%Y%m%d`
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile.runtime"
+      --destination "${CI_REGISTRY_IMAGE}:phpruntime"
+      --destination "${CI_REGISTRY_IMAGE}:phpruntime-${CI_COMMIT_SHORT_SHA}"
+  rules:
+    - changes:
+        - Dockerfile.runtime
+    - if: $FORCE_CONTAINER_REBUILD != "false"
+      when: on_success
+
+get_tools_info:
+  stage: Build container images
+  tags:
+    - dev
+    - k8s
+  image:
+    name: ${CI_REGISTRY_IMAGE}:builder
+    entrypoint: [""]
+  script:
+    - node --version
+    - npm --version
+    - php --version
+    - composer --version
+
+build_app_dev:
+  stage: Dev stage
+  tags:
+    - dev
+    - k8s
+  environment:
+    name: dev
+    url: ${ENV_URL_DEV}
+  image:
+    name: ${CI_REGISTRY_IMAGE}:builder
+    entrypoint: [""]
+  script:
+    - echo "stat $ENV_FILE"; stat $ENV_FILE
+    - source $ENV_FILE
+    - export APP_URL="$CI_ENVIRONMENT_URL"
+    - npm ci
+    - composer --no-progress install
+    - npm run prod
+    - ls -l
+    - find vendor | wc -l
+    - echo "Packing artifacts"
+    - tar -zcf ./artifacts.tar.gz -T application_filelist.txt
+    - echo "Build done"
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules
+  artifacts:
+    paths:
+      - ./artifacts.tar.gz
+    expire_in: 30 days
+
+deploy_app_dev:
+  stage: Dev stage
+  environment:
+    name: dev
+  needs:
+    - build_app_dev
+  tags:
+    - test
+    - docker
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | /usr/bin/docker login -u "$CI_REGISTRY_USER" --password-stdin ${CI_REGISTRY}
+  script:
+    - test -d "${DEPLOYMENT_PATH}" || (echo 'Failure, target path '${DEPLOYMENT_PATH}' does not exist!' && exit 1)
+    - rm -rf "${DEPLOYMENT_PATH}/*"
+    - tar -C "${DEPLOYMENT_PATH}/" -zxf ./artifacts.tar.gz
+    - docker pull ${CI_REGISTRY_IMAGE}:phpruntime
+    - cat "$ENV_FILE" > `dirname ${DEPLOYMENT_PATH}`/.env
+    - sudo docker-compose -f /apps/docker-compose.yml stop php81-app
+    - sudo docker-compose -f /apps/docker-compose.yml up -d php81-app
+    - sudo /bin/setfacl -R -m u:33:rwx "${DEPLOYMENT_PATH}/storage"
+    - sudo /bin/setfacl -d -R -m u:33:rwx "${DEPLOYMENT_PATH}/storage"
+    - if [ -n "$FORCE_DB_UPGARDE" ]; then echo 'yes' | sudo docker-compose -f /apps/docker-compose.yml exec -T php81-app php artisan migrate; else echo "FORCE_DB_UPGRADE is not set, not uppgrading the DB"; fi
+    - if [ -n "$FORCE_DB_SEED" ]; then echo 'yes' | sudo docker-compose -f /apps/docker-compose.yml exec -T php81-app php artisan db:seed; else echo "FORCE_DB_SEED is not set, not seeding the DB"; fi
+  after_script:
+    - /usr/bin/docker logout
